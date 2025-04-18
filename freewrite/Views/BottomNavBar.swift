@@ -101,8 +101,9 @@ struct BottomNavBar: View {
                     uiSettings.selectRandomFont()
                 }
                 .buttonStyle(.plain)
-                .foregroundColor(uiSettings.isHoveringBottomNav ? uiSettings.textHoverColor : uiSettings.textColor)
+                .foregroundColor(uiSettings.isHoveringRandom ? uiSettings.textHoverColor : uiSettings.textColor)
                 .onHover { hovering in
+                    uiSettings.isHoveringRandom = hovering
                     uiSettings.isHoveringBottomNav = hovering
                     hovering ? NSCursor.pointingHand.push() : NSCursor.pop()
                 }

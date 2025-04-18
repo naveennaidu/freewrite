@@ -30,6 +30,7 @@ class UISettingsViewModel: ObservableObject {
     @Published var isHoveringNewEntry = false
     @Published var isHoveringThemeToggle = false
     @Published var isHoveringSync = false
+    @Published var isHoveringRandom = false
     
     // Sidebar states
     @Published var showingSidebar = false
