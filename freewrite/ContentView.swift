@@ -10,6 +10,7 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 import PDFKit
+import Combine
 
 struct HumanEntry: Identifiable {
     let id: UUID
@@ -84,6 +85,13 @@ struct ContentView: View {
     @State private var isHoveringHistoryArrow = false
     @State private var colorScheme: ColorScheme = .light // Add state for color scheme
     @State private var isHoveringThemeToggle = false // Add state for theme toggle hover
+    
+    // iCloud sync state
+    @StateObject private var cloudManager = CloudStorageManager.shared
+    @State private var showingSyncSettings = false
+    @State private var isHoveringSync = false
+    @State private var syncStatusMessage: String? = nil
+    @State private var cancellables = Set<AnyCancellable>()
     let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
     let entryHeight: CGFloat = 40
     
@@ -101,26 +109,10 @@ struct ContentView: View {
         "\n\nJust say it"
     ]
     
-    // Add file manager and save timer
-    private let fileManager = FileManager.default
+    // Save timer
     private let saveTimer = Timer.publish(every: 1.0, on: .main, in: .common).autoconnect()
     
-    // Add cached documents directory
-    private let documentsDirectory: URL = {
-        let directory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("Freewrite")
-        
-        // Create Freewrite directory if it doesn't exist
-        if !FileManager.default.fileExists(atPath: directory.path) {
-            do {
-                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-                print("Successfully created Freewrite directory")
-            } catch {
-                print("Error creating directory: \(error)")
-            }
-        }
-        
-        return directory
-    }()
+    // Access documents directory through cloud manager
     
     // Add shared prompt constant
     private let aiChatPrompt = """
@@ -156,54 +148,48 @@ struct ContentView: View {
         _colorScheme = State(initialValue: savedScheme == "dark" ? .dark : .light)
     }
     
-    // Modify getDocumentsDirectory to use cached value
+    // Access documents directory through cloud manager
     private func getDocumentsDirectory() -> URL {
-        return documentsDirectory
+        return cloudManager.getActiveDocumentsDirectory()
     }
     
-    // Add function to save text
+    // Add function to save text using CloudStorageManager
     private func saveText() {
-        let documentsDirectory = getDocumentsDirectory()
-        let fileURL = documentsDirectory.appendingPathComponent("entry.md")
-        
-        print("Attempting to save file to: \(fileURL.path)")
-        
-        do {
-            try text.write(to: fileURL, atomically: true, encoding: .utf8)
-            print("Successfully saved file")
-        } catch {
-            print("Error saving file: \(error)")
-            print("Error details: \(error.localizedDescription)")
+        cloudManager.saveFile(filename: "entry.md", content: text) { success, error in
+            if success {
+                print("Successfully saved file")
+            } else if let error = error {
+                print("Error saving file: \(error)")
+                print("Error details: \(error.localizedDescription)")
+            }
         }
     }
     
-    // Add function to load text
+    // Add function to load text using CloudStorageManager
     private func loadText() {
-        let documentsDirectory = getDocumentsDirectory()
-        let fileURL = documentsDirectory.appendingPathComponent("entry.md")
-        
-        print("Attempting to load file from: \(fileURL.path)")
-        
-        do {
-            if fileManager.fileExists(atPath: fileURL.path) {
-                text = try String(contentsOf: fileURL, encoding: .utf8)
+        cloudManager.loadFile(filename: "entry.md") { content, error in
+            if let content = content {
+                text = content
                 print("Successfully loaded file")
+            } else if let error = error {
+                print("Error loading file: \(error)")
+                print("Error details: \(error.localizedDescription)")
             } else {
                 print("File does not exist yet")
             }
-        } catch {
-            print("Error loading file: \(error)")
-            print("Error details: \(error.localizedDescription)")
         }
     }
     
     // Add function to load existing entries
     private func loadExistingEntries() {
-        let documentsDirectory = getDocumentsDirectory()
-        print("Looking for entries in: \(documentsDirectory.path)")
-        
-        do {
-            let fileURLs = try fileManager.contentsOfDirectory(at: documentsDirectory, includingPropertiesForKeys: nil)
+        cloudManager.listFiles { fileURLs, error in
+            guard let fileURLs = fileURLs, error == nil else {
+                print("Error loading directory contents: \(error?.localizedDescription ?? "Unknown error")")
+                print("Creating default entry after error")
+                createNewEntry()
+                return
+            }
+            
             let mdFiles = fileURLs.filter { $0.pathExtension == "md" }
             
             print("Found \(mdFiles.count) .md files")
@@ -266,6 +252,9 @@ struct ContentView: View {
             
             print("Successfully loaded and sorted \(entries.count) entries")
             
+            // Store the current selection
+            let currentEntryId = selectedEntryId
+            
             // Check if we need to create a new entry
             let calendar = Calendar.current
             let today = Date()
@@ -298,44 +287,51 @@ struct ContentView: View {
                 print("First time user, creating welcome entry")
                 createNewEntry()
             } else if !hasEmptyEntryToday && !hasOnlyWelcomeEntry {
-                // No empty entry for today and not just the welcome entry - create new entry
-                print("No empty entry for today, creating new entry")
+                // Create a new empty entry for today if there isn't one
+                print("Creating new entry for today")
                 createNewEntry()
             } else {
-                // Select the most recent empty entry from today or the welcome entry
-                if let todayEntry = entries.first(where: { entry in
-                    // Convert the display date (e.g. "Mar 14") to a Date object
-                    let dateFormatter = DateFormatter()
-                    dateFormatter.dateFormat = "MMM d"
-                    if let entryDate = dateFormatter.date(from: entry.date) {
-                        // Set year component to current year since our stored dates don't include year
-                        var components = calendar.dateComponents([.year, .month, .day], from: entryDate)
-                        components.year = calendar.component(.year, from: today)
-                        
-                        // Get start of day for the entry date
-                        if let entryDateWithYear = calendar.date(from: components) {
-                            let entryDayStart = calendar.startOfDay(for: entryDateWithYear)
-                            return calendar.isDate(entryDayStart, inSameDayAs: todayStart) && entry.previewText.isEmpty
-                        }
+                // Check if we should preserve the current selection
+                if let currentId = currentEntryId, let index = entries.firstIndex(where: { $0.id == currentId }) {
+                    // If the previously selected entry still exists, keep it selected
+                    print("Preserving selected entry: \(entries[index].filename)")
+                    selectedEntryId = currentId
+                    loadEntry(entry: entries[index])
+                } else {
+                    // Otherwise, select the first entry (most recent)
+                    if let entry = entries.first {
+                        print("Selecting most recent entry: \(entry.filename)")
+                        selectedEntryId = entry.id
+                        loadEntry(entry: entry)
                     }
-                    return false
-                }) {
-                    selectedEntryId = todayEntry.id
-                    loadEntry(entry: todayEntry)
-                } else if hasOnlyWelcomeEntry {
-                    // If we only have the welcome entry, select it
-                    selectedEntryId = entries[0].id
-                    loadEntry(entry: entries[0])
                 }
             }
-            
-        } catch {
-            print("Error loading directory contents: \(error)")
-            print("Creating default entry after error")
-            createNewEntry()
         }
     }
     
+    private func isEmptyEntryFromToday(entries: [HumanEntry]) -> Bool {
+        let calendar = Calendar.current
+        let today = Date()
+        let todayStart = calendar.startOfDay(for: today)
+        
+        return entries.contains { entry in
+            // Convert the display date (e.g. "Mar 14") to a Date object
+            let dateFormatter = DateFormatter()
+            dateFormatter.dateFormat = "MMM d"
+            if let entryDate = dateFormatter.date(from: entry.date) {
+                // Set year component to current year since our stored dates don't include year
+                var components = calendar.dateComponents([.year, .month, .day], from: entryDate)
+                components.year = calendar.component(.year, from: today)
+                
+                // Get start of day for the entry date
+                if let entryDateWithYear = calendar.date(from: components) {
+                    let entryDayStart = calendar.startOfDay(for: entryDateWithYear)
+                    return calendar.isDate(entryDayStart, inSameDayAs: todayStart) && entry.previewText.isEmpty
+                }
+            }
+            return false
+        }
+    }
     var randomButtonTitle: String {
         return currentRandomFont.isEmpty ? "Random" : "Random [\(currentRandomFont)]"
     }
@@ -382,7 +378,7 @@ struct ContentView: View {
     }
     
     var body: some View {
-        let buttonBackground = colorScheme == .light ? Color.white : Color.black
+//        let buttonBackground = colorScheme == .light ? Color.white : Color.black
         let navHeight: CGFloat = 68
         let textColor = colorScheme == .light ? Color.gray : Color.gray.opacity(0.8)
         let textHoverColor = colorScheme == .light ? Color.black : Color.white
@@ -722,13 +718,103 @@ struct ContentView: View {
                             Text("•")
                                 .foregroundColor(.gray)
                             
-                            // Theme toggle button
+                            // iCloud Sync button
                             Button(action: {
-                                colorScheme = colorScheme == .light ? .dark : .light
-                                // Save preference
-                                UserDefaults.standard.set(colorScheme == .light ? "light" : "dark", forKey: "colorScheme")
+                                showingSyncSettings = true
                             }) {
-                                Image(systemName: colorScheme == .light ? "moon.fill" : "sun.max.fill")
+                                HStack(spacing: 5) {
+                                    Image(systemName: cloudManager.isSyncing ? "arrow.triangle.2.circlepath" : "icloud")
+                                        .resizable()
+                                        .aspectRatio(contentMode: .fit)
+                                        .frame(width: 16, height: 16)
+                                    
+                                    if cloudManager.isSyncing {
+                                        Text("Syncing...")
+                                            .font(.system(size: 13))
+                                    }
+                                }
+                                .foregroundColor(isHoveringSync ? textHoverColor : textColor)
+                            }
+                            .buttonStyle(.plain)
+                            .padding(.horizontal, 8)
+                            .onHover { hovering in
+                                isHoveringSync = hovering
+                                isHoveringBottomNav = hovering
+                                if hovering {
+                                    NSCursor.pointingHand.push()
+                                } else {
+                                    NSCursor.pop()
+                                }
+                            }
+                            .popover(isPresented: $showingSyncSettings, attachmentAnchor: .point(UnitPoint(x: 0.5, y: 0)), arrowEdge: .top) {
+                                VStack(alignment: .leading, spacing: 10) {
+                                    Text("iCloud Sync Settings")
+                                        .font(.headline)
+                                        .padding(.bottom, 5)
+                                    
+                                    if cloudManager.isCloudAvailable {
+                                        Toggle("Enable iCloud Sync", isOn: $cloudManager.useICloudSync)
+                                            .onChange(of: cloudManager.useICloudSync) { newValue in
+                                                if newValue {
+                                                    // Migrate local files to iCloud
+                                                    syncStatusMessage = "Migrating to iCloud..."
+                                                    cloudManager.migrateLocalToCloud { success, message in
+                                                        DispatchQueue.main.async {
+                                                            syncStatusMessage = success ? "Migration to iCloud complete" : message
+                                                            // Reload entries after migration
+                                                            self.loadExistingEntries()
+                                                        }
+                                                    }
+                                                } else {
+                                                    // Migrate iCloud files to local
+                                                    syncStatusMessage = "Migrating to local storage..."
+                                                    cloudManager.migrateCloudToLocal { success, message in
+                                                        DispatchQueue.main.async {
+                                                            syncStatusMessage = success ? "Migration to local complete" : message
+                                                            // Reload entries after migration
+                                                            self.loadExistingEntries()
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        
+                                        if let statusMessage = syncStatusMessage {
+                                            Text(statusMessage)
+                                                .font(.caption)
+                                                .foregroundColor(cloudManager.syncError != nil ? .red : .gray)
+                                                .padding(.top, 5)
+                                        }
+                                        
+                                        Text("Storage location: \(cloudManager.storageType == .iCloud ? "iCloud" : "Local")")
+                                            .font(.caption)
+                                            .foregroundColor(.gray)
+                                            .padding(.top, 5)
+                                    } else {
+                                        Text("iCloud not available on this device")
+                                            .foregroundColor(.gray)
+                                        
+                                        Text("Make sure you're signed in to iCloud in System Settings")
+                                            .font(.caption)
+                                            .foregroundColor(.gray)
+                                    }
+                                }
+                                .padding()
+                                .frame(width: 300)
+                                .background(popoverBackgroundColor)
+                            }
+                            
+                            Text("•")
+                                .foregroundColor(.gray)
+                            
+                            Button(action: {
+                                // Set light/dark mode
+                                withAnimation {
+                                    colorScheme = colorScheme == .light ? .dark : .light
+                                    
+                                    // Save preference
+                                    UserDefaults.standard.set(colorScheme == .light ? "light" : "dark", forKey: "colorScheme")
+                                }
+                            }) {   Image(systemName: colorScheme == .light ? "moon.fill" : "sun.max.fill")
                                     .foregroundColor(isHoveringThemeToggle ? textHoverColor : textColor)
                             }
                             .buttonStyle(.plain)
@@ -741,7 +827,7 @@ struct ContentView: View {
                                     NSCursor.pop()
                                 }
                             }
-
+                            
                             Text("•")
                                 .foregroundColor(.gray)
                             
@@ -941,7 +1027,21 @@ struct ContentView: View {
         .animation(.easeInOut(duration: 0.2), value: showingSidebar)
         .preferredColorScheme(colorScheme)
         .onAppear {
+            print("ContentView appeared")
             showingSidebar = false  // Hide sidebar by default
+            
+            // Set up notification for iCloud changes
+            NotificationCenter.default.publisher(for: NSNotification.Name("iCloudContentDidChange"))
+                .sink { _ in
+                    print("iCloud content changed, reloading entries")
+                    self.loadExistingEntries()
+                }
+                .store(in: &cancellables)
+            
+            // Check iCloud availability
+            cloudManager.checkiCloudAvailability()
+            
+            // Load existing entries
             loadExistingEntries()
         }
         .onChange(of: text) { _ in
@@ -1002,29 +1102,24 @@ struct ContentView: View {
     }
     
     private func saveEntry(entry: HumanEntry) {
-        let documentsDirectory = getDocumentsDirectory()
-        let fileURL = documentsDirectory.appendingPathComponent(entry.filename)
-        
-        do {
-            try text.write(to: fileURL, atomically: true, encoding: .utf8)
-            print("Successfully saved entry: \(entry.filename)")
-            updatePreviewText(for: entry)  // Update preview after saving
-        } catch {
-            print("Error saving entry: \(error)")
+        cloudManager.saveFile(filename: entry.filename, content: text) { success, error in
+            if success {
+                print("Successfully saved entry: \(entry.filename)")
+                updatePreviewText(for: entry)  // Update preview after saving
+            } else if let error = error {
+                print("Error saving entry: \(error)")
+            }
         }
     }
     
     private func loadEntry(entry: HumanEntry) {
-        let documentsDirectory = getDocumentsDirectory()
-        let fileURL = documentsDirectory.appendingPathComponent(entry.filename)
-        
-        do {
-            if fileManager.fileExists(atPath: fileURL.path) {
-                text = try String(contentsOf: fileURL, encoding: .utf8)
+        cloudManager.loadFile(filename: entry.filename) { content, error in
+            if let content = content {
+                text = content
                 print("Successfully loaded entry: \(entry.filename)")
+            } else if let error = error {
+                print("Error loading entry: \(error)")
             }
-        } catch {
-            print("Error loading entry: \(error)")
         }
     }
     
@@ -1075,30 +1170,28 @@ struct ContentView: View {
     }
     
     private func deleteEntry(entry: HumanEntry) {
-        // Delete the file from the filesystem
-        let documentsDirectory = getDocumentsDirectory()
-        let fileURL = documentsDirectory.appendingPathComponent(entry.filename)
-        
-        do {
-            try fileManager.removeItem(at: fileURL)
-            print("Successfully deleted file: \(entry.filename)")
-            
-            // Remove the entry from the entries array
-            if let index = entries.firstIndex(where: { $0.id == entry.id }) {
-                entries.remove(at: index)
+        // Delete the file from the filesystem using CloudStorageManager
+        cloudManager.deleteFile(filename: entry.filename) { success, error in
+            if success {
+                print("Successfully deleted file: \(entry.filename)")
                 
-                // If the deleted entry was selected, select the first entry or create a new one
-                if selectedEntryId == entry.id {
-                    if let firstEntry = entries.first {
-                        selectedEntryId = firstEntry.id
-                        loadEntry(entry: firstEntry)
-                    } else {
-                        createNewEntry()
+                // Remove the entry from the entries array
+                if let index = self.entries.firstIndex(where: { $0.id == entry.id }) {
+                    self.entries.remove(at: index)
+                    
+                    // If the deleted entry was selected, select the first entry or create a new one
+                    if self.selectedEntryId == entry.id {
+                        if let firstEntry = self.entries.first {
+                            self.selectedEntryId = firstEntry.id
+                            self.loadEntry(entry: firstEntry)
+                        } else {
+                            self.createNewEntry()
+                        }
                     }
                 }
+            } else if let error = error {
+                print("Error deleting file: \(error)")
             }
-        } catch {
-            print("Error deleting file: \(error)")
         }
     }
     
@@ -1143,16 +1236,15 @@ struct ContentView: View {
             saveEntry(entry: entry)
         }
         
-        // Get entry content
-        let documentsDirectory = getDocumentsDirectory()
-        let fileURL = documentsDirectory.appendingPathComponent(entry.filename)
-        
-        do {
-            // Read the content of the entry
-            let entryContent = try String(contentsOf: fileURL, encoding: .utf8)
+        // Get entry content using CloudStorageManager
+        cloudManager.loadFile(filename: entry.filename) { entryContent, error in
+            guard let entryContent = entryContent, error == nil else {
+                print("Error loading file for PDF export: \(error?.localizedDescription ?? "Unknown error")")
+                return
+            }
             
             // Extract a title from the entry content and add .pdf extension
-            let suggestedFilename = extractTitleFromContent(entryContent, date: entry.date) + ".pdf"
+            let suggestedFilename = self.extractTitleFromContent(entryContent, date: entry.date) + ".pdf"
             
             // Create save panel
             let savePanel = NSSavePanel()
@@ -1163,13 +1255,15 @@ struct ContentView: View {
             // Show save dialog
             if savePanel.runModal() == .OK, let url = savePanel.url {
                 // Create PDF data
-                if let pdfData = createPDFFromText(text: entryContent) {
-                    try pdfData.write(to: url)
-                    print("Successfully exported PDF to: \(url.path)")
+                if let pdfData = self.createPDFFromText(text: entryContent) {
+                    do {
+                        try pdfData.write(to: url)
+                        print("Successfully exported PDF to: \(url.path)")
+                    } catch {
+                        print("Error writing PDF data: \(error)")
+                    }
                 }
             }
-        } catch {
-            print("Error in PDF export: \(error)")
         }
     }
     
